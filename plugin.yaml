@@ -1,0 +1,17 @@
+# Mnemozia Plugin for Hermes Agent
+# Install: git clone https://github.com/megazhuk/Mnemozia.git ~/.hermes/plugins/mnemozia
+
+name: mnemozia
+version: 1.0.0
+description: Semantic knowledge base — Mnemozia (Μνημοσύνη). Store, search, and evolve facts using LanceDB embeddings with versioning.
+author: Hermes Community
+license: MIT
+
+tools:
+  - tools/kb_tool.py
+
+toolsets:
+  mnemozia:
+    description: Mnemozia semantic knowledge base — store, search, update, merge, split facts with vector search
+    tools:
+      - kb

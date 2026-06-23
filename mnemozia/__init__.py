@@ -2,7 +2,7 @@
 Mnemozia — semantic knowledge base for Hermes Agent.
 
 Named after Mnemosyne (Μνημοσύνη), the Greek goddess of memory.
-Built on LanceDB + intfloat/multilingual-e5-small.
+Built on PostgreSQL + pgvector + intfloat/multilingual-e5-small.
 Lazy-loads the embedding model — zero RAM cost until first query.
 """
 

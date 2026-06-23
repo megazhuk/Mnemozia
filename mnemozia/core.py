@@ -2,9 +2,9 @@
 Mnemozia — semantic knowledge base with versioning, dedup, and hybrid search.
 
 Named after Mnemosyne (Μνημοσύνη), the Greek goddess of memory.
-Built on LanceDB + intfloat/multilingual-e5-small (384-dim embeddings, ~400 MB RAM).
+Built on PostgreSQL + pgvector + intfloat/multilingual-e5-small (384-dim, ~400 MB RAM).
 Designed for VPS with tight memory limits — model is lazy-loaded, searches use
-LanceDB-native filtering (no pandas DataFrames pulled into memory).
+pgvector's HNSW/IVFFlat indexes for fast vector search.
 
 Operations:
     add       search     update     merge      split
@@ -14,16 +14,24 @@ Operations:
 
 from __future__ import annotations
 
+import json
+import os
+import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
+import psycopg2
+import psycopg2.extras
+
 from .schema import (
-    NoteSchema,
     QUERY_PREFIX,
     PASSAGE_PREFIX,
-    get_embedding_model,
-    open_or_create_table,
+    compute_embeddings,
+    connect,
+    ensure_schema,
+    _now,
+    _uid,
 )
 
 
@@ -34,7 +42,6 @@ from .schema import (
 _DEDUP_THRESHOLD = 0.08   # cosine distance: ≤ this → near-duplicate
 _FLAG_THRESHOLD = 0.25    # cosine distance: ≤ this → flag for review
 
-# Valid categories (extensible — new ones are auto-added)
 _PRESET_CATEGORIES = {
     "general", "work", "personal", "finance", "credentials",
     "ideas", "tech", "devops", "programming", "schedule",
@@ -46,16 +53,8 @@ _PRESET_CATEGORIES = {
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════
 
-def _now() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _uid() -> str:
-    return uuid.uuid4().hex[:12]
-
 
 def _distance_to_stars(distance: float) -> str:
-    """Convert cosine distance (0=identical, 1=unrelated) to visual stars."""
     if distance < 0.06:
         return "★★★★★"
     if distance < 0.12:
@@ -76,12 +75,11 @@ def _confidence_flag(conf: float) -> str:
 
 
 def _format_result(row: dict, rank: int) -> str:
-    """LLM-optimised single-result formatter."""
     stars = _distance_to_stars(row.get("_distance", 0.0))
     dist = row.get("_distance", 0.0)
     conf = row.get("confidence", 1.0)
     flag = _confidence_flag(conf)
-    tags = row.get("tags", "")
+    tags = row.get("tags", "") or ""
     tag_str = f" | 🏷 {tags}" if tags else ""
 
     return (
@@ -101,35 +99,64 @@ def _parse_float(val, default: float) -> float:
         return default
 
 
+def _row_to_dict(row) -> dict:
+    """Convert a psycopg2 RealDictRow or plain tuple to a plain dict with string timestamps."""
+    if isinstance(row, dict):
+        d = dict(row)
+    else:
+        # NamedTuple or tuple — convert
+        d = {}
+        for desc in row._fields if hasattr(row, '_fields') else []:
+            d[desc] = getattr(row, desc)
+    # Convert datetime to string
+    for k, v in d.items():
+        if isinstance(v, datetime):
+            d[k] = v.strftime("%Y-%m-%d %H:%M:%S")
+        elif isinstance(v, (list,)) and k == "embedding":
+            # Store embedding as list for JSON serialization
+            pass
+    return d
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Core engine
 # ═══════════════════════════════════════════════════════════════════════
 
+
 class MnemoziaKB:
     """
-    Chronological semantic memory engine.
+    Chronological semantic memory engine (PostgreSQL + pgvector).
 
     Usage:
-        kb = MnemoziaKB("/home/user/.hermes/knowledge_base")
+        kb = MnemoziaKB("postgresql://postgres:postgres@127.0.0.1:5432/postgres")
         result = kb.execute({"action": "search", "query": "OpenRouter proxy"})
     """
 
-    def __init__(self, db_path: str = "~/.hermes/knowledge_base", table_name: str = "notes"):
-        import os
-        self.db_path = os.path.expanduser(db_path)
+    def __init__(self, db_uri: Optional[str] = None, table_name: str = "notes"):
+        self.db_uri = db_uri or os.environ.get(
+            "Mnemozia_URI",
+            "postgresql://postgres:postgres@127.0.0.1:5432/postgres",
+        )
         self.table_name = table_name
-        self._table = None           # lazy-open on first execute()
+        self._conn = None  # lazy-open on first execute()
 
-    # ── lazy accessor (model + table only load when actually used) ──
+    # ── lazy accessor ──
 
     @property
-    def table(self):
-        if self._table is None:
-            self._table = open_or_create_table(self.db_path, self.table_name)
-        return self._table
+    def conn(self):
+        if self._conn is None:
+            self._conn = connect(self.db_uri)
+            # Use RealDictCursor so rows are returned as dicts
+            ensure_schema(self._conn)
+        return self._conn
+
+    @property
+    def cur(self):
+        """Return a cursor with RealDictCursor factory."""
+        return self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     # ═══════════════════════════════════════════════════════════════════
-    # Public entry point (called by Hermes tool / CLI)
+    # Public entry point
     # ═══════════════════════════════════════════════════════════════════
 
     def execute(self, arguments: Dict[str, Any]) -> str:
@@ -146,6 +173,19 @@ class MnemoziaKB:
             return handler(arguments)
         except Exception as exc:
             return f"❌ Error in action '{action}': {exc}"
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Embedding helpers
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _embed(self, text: str, is_query: bool = True) -> list[float]:
+        """Embed text using the lazy-loaded model with E5 prefixes."""
+        prefix = QUERY_PREFIX if is_query else PASSAGE_PREFIX
+        result = compute_embeddings([f"{prefix}{text}"])
+        return result[0]
+
+    def _embed_passage(self, text: str) -> list[float]:
+        return self._embed(text, is_query=False)
 
     # ═══════════════════════════════════════════════════════════════════
     # ACTION: add  (with dedup)
@@ -166,43 +206,36 @@ class MnemoziaKB:
         language = (args.get("language") or "auto").strip()
 
         # ── Step 1: exact text match ──
-        try:
-            # Use table query (not FTS search) to find exact text duplicates
-            exact = self.table.to_lance().scanner(
-                filter=f"text = '{text}' AND is_active = True"
-            ).to_table()
-            if exact.num_rows > 0:
-                eid = exact.column("id")[0].as_py()
-                return (
-                    f"🔁 Exact duplicate found [ID: {eid}].\n"
-                    f"   Use update to change it, or add with different text."
-                )
-        except Exception:
-            pass  # scanner fallback; proceed
+        cur = self.cur
+        cur.execute(
+            "SELECT id FROM notes WHERE text = %s AND is_active = TRUE LIMIT 1",
+            (text,)
+        )
+        row = cur.fetchone()
+        if row:
+            return (
+                f"🔁 Exact duplicate found [ID: {row['id']}].\n"
+                f"   Use update to change it, or add with different text."
+            )
 
         # ── Step 2: semantic near-duplicate check ──
-        similar = self._search_semantic(
-            text, limit=3, threshold=_DEDUP_THRESHOLD, active_only=True
-        )
+        similar = self._search_semantic(text, limit=3, threshold=_DEDUP_THRESHOLD)
         if similar:
             s = similar[0]
-            sid = s["id"]
             return (
-                f"🔁 Near-duplicate found [ID: {sid}] (distance={s['_distance']:.3f}).\n"
-                f"   Existing: \"{s['text'][:120]}{'…' if len(s['text'])>120 else ''}\"\n"
+                f"🔁 Near-duplicate found [ID: {s['id']}] (distance={s['_distance']:.3f}).\n"
+                f"   Existing: \"{s['text'][:120]}{'…' if len(s['text']) > 120 else ''}\"\n"
                 f"   Use update to replace, or merge to combine both facts."
             )
 
         # ── Step 3: potential contradiction flag ──
-        flagged = self._search_semantic(
-            text, limit=1, threshold=_FLAG_THRESHOLD, active_only=True
-        )
+        flagged = self._search_semantic(text, limit=1, threshold=_FLAG_THRESHOLD)
         warning = ""
         if flagged:
             f = flagged[0]
             warning = (
                 f"\n   ⚠️  Related fact exists [ID: {f['id']}] (distance={f['_distance']:.3f}):\n"
-                f"   \"{f['text'][:120]}{'…' if len(f['text'])>120 else ''}\"\n"
+                f"   \"{f['text'][:120]}{'…' if len(f['text']) > 120 else ''}\"\n"
                 f"   Review for contradiction before trusting this fact."
             )
 
@@ -210,25 +243,19 @@ class MnemoziaKB:
         now = _now()
         fact_id = _uid()
         vector = self._embed_passage(text)
-        self.table.add([{
-            "id": fact_id,
-            "text": text,
-            "vector": vector,
-            "category": category,
-            "tags": tags,
-            "language": language,
-            "confidence": confidence,
-            "importance": importance,
-            "ttl_days": ttl_days,
-            "source": source,
-            "source_detail": source_detail,
-            "version": 1,
-            "is_active": True,
-            "created_at": now,
-            "updated_at": now,
-            "supersedes": "",
-            "related_to": "",
-        }])
+
+        cur.execute(
+            """INSERT INTO notes
+               (id, text, embedding, category, tags, language,
+                confidence, importance, ttl_days, source, source_detail,
+                version, is_active, created_at, updated_at, supersedes, related_to)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                       1, TRUE, %s, %s, '', '')""",
+            (fact_id, text, vector, category, tags, language,
+             confidence, importance, ttl_days, source, source_detail,
+             now, now)
+        )
+        self.conn.commit()
         return f"✅ Stored [{fact_id}] | {category} | confidence={confidence:.1f}{warning}"
 
     # ═══════════════════════════════════════════════════════════════════
@@ -246,33 +273,40 @@ class MnemoziaKB:
         tags = (args.get("tags") or "").strip()
         language = (args.get("language") or "").strip()
         min_confidence = _parse_float(args.get("min_confidence"), 0.0)
-        since = (args.get("since") or "").strip()  # YYYY-MM-DD
+        since = (args.get("since") or "").strip()
 
-        # ── build where clause ──
-        where_parts = ["is_active = True"]
+        # ── build filter clauses ──
+        filters = ["n.is_active = TRUE"]
+        params: list = []
+
         if category:
-            # hierarchical: "devops/networking" matches "devops/networking/proxy"
-            where_parts.append(f"category LIKE '{category}%'")
+            filters.append("n.category LIKE %s")
+            params.append(f"{category}%")
         if tags:
             for tag in tags.split(","):
                 t = tag.strip()
                 if t:
-                    where_parts.append(f"tags LIKE '%{t}%'")
+                    filters.append("n.tags LIKE %s")
+                    params.append(f"%{t}%")
         if language and language != "auto":
-            where_parts.append(f"language = '{language}'")
+            filters.append("n.language = %s")
+            params.append(language)
         if min_confidence > 0:
-            where_parts.append(f"confidence >= {min_confidence}")
+            filters.append("n.confidence >= %s")
+            params.append(min_confidence)
         if since:
-            where_parts.append(f"updated_at >= '{since}'")
-        where = " AND ".join(where_parts)
+            filters.append("n.updated_at >= %s")
+            params.append(since)
+
+        where = " AND ".join(filters)
 
         # ── search ──
         if mode == "keyword":
-            results = self._search_keyword(query, where, limit)
+            results = self._search_keyword(query, where, params, limit)
         elif mode == "semantic":
             results = self._search_semantic(query, limit=limit)
         else:  # hybrid
-            results = self._search_hybrid(query, where, limit)
+            results = self._search_hybrid(query, where, params, limit)
 
         if not results:
             return (
@@ -299,10 +333,105 @@ class MnemoziaKB:
         if len(results) >= 2 and results[0].get("_distance", 1) < 0.06:
             tip = (
                 f"\n\n💡 *Tip:* facts [{results[0]['id']}] and [{results[1]['id']}] "
-                f"are near-identical. Consider `action=merge id={results[0]['id']} with={results[1]['id']}`."
+                f"are near-identical. Consider `action=merge id={results[0]['id']} "
+                f"with={results[1]['id']}`."
             )
 
         return header + body + tip
+
+    def _search_semantic(
+        self,
+        query: str,
+        limit: int = 5,
+        threshold: Optional[float] = None,
+        active_only: bool = True,
+    ) -> list:
+        """Pure vector search via pgvector cosine distance."""
+        vec = self._embed(query, is_query=True)
+        vec_str = f"[{','.join(str(v) for v in vec)}]"
+
+        active_clause = "AND n.is_active = TRUE" if active_only else ""
+        threshold_clause = f"AND n.embedding <=> '{vec_str}'::vector <= {threshold}" if threshold is not None else ""
+
+        cur = self.cur
+        sql = f"""
+            SELECT n.*, n.embedding <=> %s::vector AS _distance
+            FROM notes n
+            WHERE 1=1 {active_clause} {threshold_clause}
+            ORDER BY _distance
+            LIMIT %s
+        """
+        cur.execute(sql, (vec_str, limit))
+        rows = cur.fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+    def _search_keyword(self, query: str, where: str, params: list, limit: int) -> list:
+        """Keyword search — full SQL ILIKE + tsvector."""
+        cur = self.cur
+        # tsvector search for full-text, ILIKE as fallback
+        sql = f"""
+            SELECT n.*, 0.0 AS _distance
+            FROM notes n
+            WHERE {where}
+              AND (n.text ILIKE %s OR n.text ILIKE %s)
+            ORDER BY n.updated_at DESC
+            LIMIT %s
+        """
+        like_param = f"%{query}%"
+        words = query.split()
+        word_likes = " OR ".join(f"n.text ILIKE %s" for _ in words)
+        # Use word-level ILIKE for better keyword search
+        sql = f"""
+            SELECT n.*, 0.0 AS _distance
+            FROM notes n
+            WHERE {where}
+              AND ({word_likes})
+            ORDER BY n.updated_at DESC
+            LIMIT %s
+        """
+        params_keyword = params + [f"%{w}%" for w in words] + [limit]
+        try:
+            cur.execute(sql, params_keyword)
+            rows = cur.fetchall()
+            return [_row_to_dict(r) for r in rows]
+        except Exception:
+            # Fallback: simple ILIKE
+            params_fallback = params + [f"%{query}%", limit]
+            cur.execute(
+                f"""
+                SELECT n.*, 0.0 AS _distance
+                FROM notes n
+                WHERE {where}
+                  AND n.text ILIKE %s
+                ORDER BY n.updated_at DESC
+                LIMIT %s
+                """,
+                params_fallback
+            )
+            rows = cur.fetchall()
+            return [_row_to_dict(r) for r in rows]
+
+    def _search_hybrid(self, query: str, where: str, params: list, limit: int) -> list:
+        """Semantic search with pre-filter."""
+        vec = self._embed(query, is_query=True)
+        vec_str = f"[{','.join(str(v) for v in vec)}]"
+
+        l = max(limit * 2, 10)  # fetch more for re-ranking
+        cur = self.cur
+        sql = f"""
+            SELECT n.*, n.embedding <=> %s::vector AS _distance
+            FROM notes n
+            WHERE {where}
+            ORDER BY _distance
+            LIMIT %s
+        """
+        try:
+            cur.execute(sql, [vec_str] + params + [l])
+            rows = cur.fetchall()
+            return [_row_to_dict(r) for r in rows][:limit]
+        except Exception:
+            # Fallback to pure semantic
+            return self._search_semantic(query, limit=limit)
 
     # ═══════════════════════════════════════════════════════════════════
     # ACTION: update
@@ -328,7 +457,6 @@ class MnemoziaKB:
         now = _now()
         new_version = int(old["version"]) + 1
 
-        # ── update category / tags if provided ──
         new_category = (args.get("category") or old.get("category", "general")).lower()
         new_tags = args.get("tags", old.get("tags", ""))
         new_confidence = _parse_float(args.get("confidence"), old.get("confidence", 1.0))
@@ -336,38 +464,35 @@ class MnemoziaKB:
         new_ttl = int(args.get("ttl_days", old.get("ttl_days", 0)))
 
         # ── soft-delete old version ──
-        self.table.update(
-            where=f"id = '{fact_id}' AND version = {old['version']}",
-            values={"is_active": False}
+        cur = self.cur
+        cur.execute(
+            "UPDATE notes SET is_active = FALSE WHERE id = %s AND version = %s",
+            (fact_id, old["version"])
         )
 
         # ── insert new version ──
         vector = self._embed_passage(new_text)
-        self.table.add([{
-            "id": fact_id,
-            "text": new_text,
-            "vector": vector,
-            "category": new_category,
-            "tags": new_tags,
-            "language": old.get("language", "auto"),
-            "confidence": new_confidence,
-            "importance": new_importance,
-            "ttl_days": new_ttl,
-            "source": old.get("source", ""),
-            "source_detail": old.get("source_detail", ""),
-            "version": new_version,
-            "is_active": True,
-            "created_at": old["created_at"],
-            "updated_at": now,
-            "supersedes": old.get("supersedes", ""),
-            "related_to": old.get("related_to", ""),
-        }])
+        cur.execute(
+            """INSERT INTO notes
+               (id, text, embedding, category, tags, language,
+                confidence, importance, ttl_days, source, source_detail,
+                version, is_active, created_at, updated_at, supersedes, related_to)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                       %s, TRUE, %s, %s, %s, %s)""",
+            (fact_id, new_text, vector, new_category, new_tags,
+             old.get("language", "auto"), new_confidence, new_importance,
+             new_ttl, old.get("source", ""), old.get("source_detail", ""),
+             new_version, old.get("created_at", now), now,
+             old.get("supersedes", ""), old.get("related_to", ""))
+        )
+        self.conn.commit()
+
         return (
             f"✅ Updated [{fact_id}] → v{new_version} at {now}.\n"
             f"   Old (v{old['version']}): \"{old['text'][:100]}"
-            f"{'…' if len(old['text'])>100 else ''}\"\n"
+            f"{'…' if len(old['text']) > 100 else ''}\"\n"
             f"   New (v{new_version}): \"{new_text[:100]}"
-            f"{'…' if len(new_text)>100 else ''}\""
+            f"{'…' if len(new_text) > 100 else ''}\""
         )
 
     # ═══════════════════════════════════════════════════════════════════
@@ -384,7 +509,6 @@ class MnemoziaKB:
         if primary_id == with_id:
             return "❌ Cannot merge a fact with itself."
 
-        # ── fetch both facts ──
         p = self._get_active_by_id(primary_id)
         w = self._get_active_by_id(with_id)
 
@@ -392,43 +516,48 @@ class MnemoziaKB:
             return f"❌ No active fact with ID '{primary_id}'."
         if not w:
             return f"❌ No active fact with ID '{with_id}'."
+
         now = _now()
         new_text = merged_text or f"{p['text']} | {w['text']}"
 
         # ── deactivate both originals ──
-        self.table.update(
-            where=f"id = '{primary_id}' AND version = {p['version']}",
-            values={"is_active": False}
+        cur = self.cur
+        cur.execute(
+            "UPDATE notes SET is_active = FALSE WHERE id = %s AND version = %s",
+            (primary_id, p["version"])
         )
-        self.table.update(
-            where=f"id = '{with_id}' AND version = {w['version']}",
-            values={"is_active": False}
+        cur.execute(
+            "UPDATE notes SET is_active = FALSE WHERE id = %s AND version = %s",
+            (with_id, w["version"])
         )
 
         # ── create merged fact ──
         new_id = _uid()
-        joined_related = _join_ids(p.get("related_to", ""), w.get("related_to", ""),
-                                  primary_id, with_id)
+        joined_related = _join_ids(
+            p.get("related_to", ""), w.get("related_to", ""),
+            primary_id, with_id
+        )
         vector = self._embed_passage(new_text)
-        self.table.add([{
-            "id": new_id,
-            "text": new_text,
-            "vector": vector,
-            "category": p.get("category", "general"),
-            "tags": _join_tags(p.get("tags", ""), w.get("tags", "")),
-            "language": p.get("language", "auto"),
-            "confidence": max(p.get("confidence", 0), w.get("confidence", 0)),
-            "importance": max(p.get("importance", 0.5), w.get("importance", 0.5)),
-            "ttl_days": max(p.get("ttl_days", 0), w.get("ttl_days", 0)),
-            "source": "merge",
-            "source_detail": f"Merged from {primary_id} + {with_id} on {now}",
-            "version": 1,
-            "is_active": True,
-            "created_at": now,
-            "updated_at": now,
-            "supersedes": f"{primary_id},{with_id}",
-            "related_to": joined_related,
-        }])
+
+        cur.execute(
+            """INSERT INTO notes
+               (id, text, embedding, category, tags, language,
+                confidence, importance, ttl_days, source, source_detail,
+                version, is_active, created_at, updated_at, supersedes, related_to)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                       1, TRUE, %s, %s, %s, %s)""",
+            (new_id, new_text, vector, p.get("category", "general"),
+             _join_tags(p.get("tags", ""), w.get("tags", "")),
+             p.get("language", "auto"),
+             max(p.get("confidence", 0), w.get("confidence", 0)),
+             max(p.get("importance", 0.5), w.get("importance", 0.5)),
+             max(p.get("ttl_days", 0), w.get("ttl_days", 0)),
+             "merge",
+             f"Merged from {primary_id} + {with_id} on {now}",
+             now, now, f"{primary_id},{with_id}", joined_related)
+        )
+        self.conn.commit()
+
         return (
             f"✅ Merged [{primary_id}] + [{with_id}] → [{new_id}].\n"
             f"   Originals archived (v{p['version']} and v{w['version']})."
@@ -440,13 +569,12 @@ class MnemoziaKB:
 
     def _action_split(self, args: dict) -> str:
         fact_id = (args.get("id") or "").strip()
-        parts_raw = args.get("parts")  # string or list
+        parts_raw = args.get("parts")
         if not fact_id:
             return "❌ Missing required field: 'id'."
         if not parts_raw:
-            return "❌ Missing required field: 'parts' (comma-separated texts or JSON list)."
+            return "❌ Missing required field: 'parts' (pipe-separated texts or JSON list)."
 
-        # ── parse parts ──
         if isinstance(parts_raw, list):
             parts = [str(p).strip() for p in parts_raw if str(p).strip()]
         else:
@@ -454,16 +582,17 @@ class MnemoziaKB:
         if len(parts) < 2:
             return "❌ Need at least 2 parts to split. Use '|' as separator."
 
-        # ── fetch original ──
         orig = self._get_active_by_id(fact_id)
         if not orig:
             return f"❌ No active fact with ID '{fact_id}'."
+
         now = _now()
+        cur = self.cur
 
         # ── deactivate original ──
-        self.table.update(
-            where=f"id = '{fact_id}' AND version = {orig['version']}",
-            values={"is_active": False}
+        cur.execute(
+            "UPDATE notes SET is_active = FALSE WHERE id = %s AND version = %s",
+            (fact_id, orig["version"])
         )
 
         # ── create child facts ──
@@ -472,28 +601,30 @@ class MnemoziaKB:
             nid = _uid()
             new_ids.append(nid)
             vector = self._embed_passage(part)
-            self.table.add([{
-                "id": nid,
-                "text": part,
-                "vector": vector,
-                "category": orig.get("category", "general"),
-                "tags": orig.get("tags", ""),
-                "language": orig.get("language", "auto"),
-                "confidence": orig.get("confidence", 1.0),
-                "importance": orig.get("importance", 0.5),
-                "source": "split",
-                "source_detail": f"Split from {fact_id} (part {i+1}/{len(parts)})",
-                "version": 1,
-                "is_active": True,
-                "created_at": now,
-                "updated_at": now,
-                "supersedes": fact_id,
-                "related_to": ",".join(n for n in new_ids if n != nid),
-            }])
+
+            related = ",".join(n for n in new_ids if n != nid)
+            cur.execute(
+                """INSERT INTO notes
+                   (id, text, embedding, category, tags, language,
+                    confidence, importance, source, source_detail,
+                    version, is_active, created_at, updated_at, supersedes, related_to)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                           1, TRUE, %s, %s, %s, %s)""",
+                (nid, part, vector, orig.get("category", "general"),
+                 orig.get("tags", ""), orig.get("language", "auto"),
+                 orig.get("confidence", 1.0), orig.get("importance", 0.5),
+                 "split",
+                 f"Split from {fact_id} (part {i+1}/{len(parts)})",
+                 now, now, fact_id, related)
+            )
+        self.conn.commit()
+
         return (
             f"✅ Split [{fact_id}] → {len(parts)} atomic facts:\n"
-            + "\n".join(f"   [{nid}] {part[:100]}{'…' if len(part)>100 else ''}"
-                        for nid, part in zip(new_ids, parts))
+            + "\n".join(
+                f"   [{nid}] {part[:100]}{'…' if len(part) > 100 else ''}"
+                for nid, part in zip(new_ids, parts)
+            )
         )
 
     # ═══════════════════════════════════════════════════════════════════
@@ -507,24 +638,33 @@ class MnemoziaKB:
         old = self._get_active_by_id(fact_id)
         if not old:
             return f"❌ No active fact with ID '{fact_id}'."
-        self.table.update(
-            where=f"id = '{fact_id}' AND version = {old['version']}",
-            values={"is_active": False}
+        cur = self.cur
+        cur.execute(
+            "UPDATE notes SET is_active = FALSE WHERE id = %s AND version = %s",
+            (fact_id, old["version"])
         )
+        self.conn.commit()
         return f"🗄 Archived [{fact_id}] (v{old['version']}). Use 'reactivate' to restore."
 
     def _action_reactivate(self, args: dict) -> str:
         fact_id = (args.get("id") or "").strip()
         if not fact_id:
             return "❌ Missing required field: 'id'."
-        all_versions = self._get_all_by_id(fact_id)
-        if not all_versions:
-            return f"❌ No fact with ID '{fact_id}'."
-        latest = max(all_versions, key=lambda r: r.get("version", 0))
-        self.table.update(
-            where=f"id = '{fact_id}' AND version = {latest['version']}",
-            values={"is_active": True, "updated_at": _now()}
+        cur = self.cur
+        # Find the latest version
+        cur.execute(
+            "SELECT * FROM notes WHERE id = %s ORDER BY version DESC LIMIT 1",
+            (fact_id,)
         )
+        latest = cur.fetchone()
+        if not latest:
+            return f"❌ No fact with ID '{fact_id}'."
+        cur.execute(
+            "UPDATE notes SET is_active = TRUE, updated_at = %s "
+            "WHERE id = %s AND version = %s",
+            (_now(), fact_id, latest["version"])
+        )
+        self.conn.commit()
         return f"♻️ Reactivated [{fact_id}] (v{latest['version']})."
 
     # ═══════════════════════════════════════════════════════════════════
@@ -535,16 +675,27 @@ class MnemoziaKB:
         fact_id = (args.get("id") or "").strip()
         if not fact_id:
             return "❌ Missing required field: 'id'."
-        rows = self._get_all_by_id(fact_id)
+        cur = self.cur
+        cur.execute(
+            "SELECT * FROM notes WHERE id = %s ORDER BY version",
+            (fact_id,)
+        )
+        rows = cur.fetchall()
         if not rows:
             return f"❌ No history for ID '{fact_id}'."
-        rows.sort(key=lambda r: r.get("version", 0))
+
         created = rows[0].get("created_at", "?")
+        if isinstance(created, datetime):
+            created = created.strftime("%Y-%m-%d %H:%M:%S")
         out = [f"📜 *Evolution of [{fact_id}]* (created {created})\n"]
         for r in rows:
+            r = _row_to_dict(r)
             status = "✅ active" if r.get("is_active") else "🗄 archived"
+            upd = r.get("updated_at", "?")
+            if isinstance(upd, datetime):
+                upd = upd.strftime("%Y-%m-%d %H:%M:%S")
             out.append(
-                f"  v{r['version']}  {r['updated_at']}  [{status}]\n"
+                f"  v{r['version']}  {upd}  [{status}]\n"
                 f"    {r['text']}"
             )
         return "\n".join(out)
@@ -554,51 +705,37 @@ class MnemoziaKB:
     # ═══════════════════════════════════════════════════════════════════
 
     def _action_review(self, args: dict) -> str:
-        """Show facts that need human attention: low confidence, stale, or TTL-expired."""
         limit = int(args.get("limit", 10))
-        now = datetime.now()
+        cur = self.cur
         out = []
 
         # ── low confidence ──
-        try:
-            low_tbl = self.table.to_lance().scanner(
-                filter="is_active = True AND confidence < 0.5",
-                limit=limit,
-            ).to_table()
-            low = []
-            col_names = low_tbl.column_names()
-            for i in range(low_tbl.num_rows):
-                low.append({col: low_tbl.column(col)[i].as_py() for col in col_names})
-        except Exception:
-            low = self.table.search().where("is_active = True AND confidence < 0.5").limit(limit).to_list()
+        cur.execute(
+            "SELECT * FROM notes WHERE is_active = TRUE AND confidence < 0.5 LIMIT %s",
+            (limit,)
+        )
+        low = cur.fetchall()
         if low:
             out.append(f"⚠️ *Low confidence (<0.5)* — {len(low)} facts:")
             for r in low:
+                r = _row_to_dict(r)
                 out.append(f"  [{r['id']}] c={r['confidence']:.1f} | {r['text'][:100]}")
 
         # ── stale (not updated in 90+ days) ──
-        try:
-            all_tbl = self.table.to_lance().scanner(
-                filter="is_active = True"
-            ).to_table()
-            col_names = all_tbl.column_names()
-            all_active = []
-            for i in range(all_tbl.num_rows):
-                all_active.append({col: all_tbl.column(col)[i].as_py() for col in col_names})
-        except Exception:
-            all_active = []
-        try:
-            from datetime import timedelta
-            stale = [
-                r for r in all_active
-                if (now - datetime.strptime(r["updated_at"], "%Y-%m-%d %H:%M:%S")).days > 90
-            ][:limit]
-            if stale:
-                out.append(f"\n🕰 *Stale (>90 days)* — {len(stale)} facts:")
-                for r in stale:
-                    out.append(f"  [{r['id']}] {r['updated_at']} | {r['text'][:100]}")
-        except Exception:
-            pass
+        cutoff = datetime.now() - timedelta(days=90)
+        cur.execute(
+            "SELECT * FROM notes WHERE is_active = TRUE AND updated_at < %s LIMIT %s",
+            (cutoff, limit)
+        )
+        stale = cur.fetchall()
+        if stale:
+            out.append(f"\n🕰 *Stale (>90 days)* — {len(stale)} facts:")
+            for r in stale:
+                r = _row_to_dict(r)
+                upd = r.get("updated_at", "?")
+                if isinstance(upd, datetime):
+                    upd = upd.strftime("%Y-%m-%d")
+                out.append(f"  [{r['id']}] {upd} | {r['text'][:100]}")
 
         if not out:
             return "✅ Knowledge base is clean — no facts need review."
@@ -611,37 +748,49 @@ class MnemoziaKB:
     # ═══════════════════════════════════════════════════════════════════
 
     def _action_stats(self, args: dict) -> str:  # noqa: ARG002
-        # Use scanner for full table scan (no FTS needed)
-        try:
-            tbl = self.table.to_lance().scanner().to_table()
-            col_names = tbl.column_names()
-            all_rows = []
-            for i in range(tbl.num_rows):
-                all_rows.append({col: tbl.column(col)[i].as_py() for col in col_names})
-        except Exception:
-            all_rows = self.table.search().limit(10000).to_list()
-        total = len(all_rows)
-        active = sum(1 for r in all_rows if r.get("is_active"))
+        cur = self.cur
+
+        cur.execute("SELECT COUNT(*) AS total FROM notes")
+        total = cur.fetchone()["total"]
+
+        cur.execute("SELECT COUNT(*) AS active FROM notes WHERE is_active = TRUE")
+        active = cur.fetchone()["active"]
         archived = total - active
 
         # ── by category ──
-        cat_counts: Dict[str, int] = {}
-        for r in all_rows:
-            if r.get("is_active"):
-                cat_counts[r.get("category", "general")] = cat_counts.get(r.get("category", "general"), 0) + 1
-        cat_lines = "\n".join(f"  {c}: {n}" for c, n in sorted(cat_counts.items(), key=lambda x: -x[1])[:10])
+        cur.execute(
+            "SELECT category, COUNT(*) AS cnt FROM notes "
+            "WHERE is_active = TRUE GROUP BY category ORDER BY cnt DESC LIMIT 10"
+        )
+        cat_rows = cur.fetchall()
+        cat_lines = "\n".join(
+            f"  {r['category']}: {r['cnt']}" for r in cat_rows
+        )
 
         # ── by language ──
-        lang_counts: Dict[str, int] = {}
-        for r in all_rows:
-            if r.get("is_active"):
-                lang_counts[r.get("language", "auto")] = lang_counts.get(r.get("language", "auto"), 0) + 1
-        lang_lines = "\n".join(f"  {l}: {n}" for l, n in sorted(lang_counts.items(), key=lambda x: -x[1]))
+        cur.execute(
+            "SELECT language, COUNT(*) AS cnt FROM notes "
+            "WHERE is_active = TRUE GROUP BY language ORDER BY cnt DESC"
+        )
+        lang_rows = cur.fetchall()
+        lang_lines = "\n".join(
+            f"  {r['language']}: {r['cnt']}" for r in lang_rows
+        )
 
         # ── confidence distribution ──
-        high_conf = sum(1 for r in all_rows if r.get("is_active") and r.get("confidence", 0) >= 0.9)
-        med_conf = sum(1 for r in all_rows if r.get("is_active") and 0.5 <= r.get("confidence", 0) < 0.9)
-        low_conf = sum(1 for r in all_rows if r.get("is_active") and r.get("confidence", 0) < 0.5)
+        cur.execute(
+            "SELECT COUNT(*) AS cnt FROM notes WHERE is_active = TRUE AND confidence >= 0.9"
+        )
+        high_conf = cur.fetchone()["cnt"]
+        cur.execute(
+            "SELECT COUNT(*) AS cnt FROM notes WHERE is_active = TRUE "
+            "AND confidence >= 0.5 AND confidence < 0.9"
+        )
+        med_conf = cur.fetchone()["cnt"]
+        cur.execute(
+            "SELECT COUNT(*) AS cnt FROM notes WHERE is_active = TRUE AND confidence < 0.5"
+        )
+        low_conf = cur.fetchone()["cnt"]
 
         return (
             f"📊 *Knowledge Base Stats*\n\n"
@@ -652,7 +801,7 @@ class MnemoziaKB:
             f"  Low confidence (<0.5): {low_conf}\n"
             f"\n📂 *By category:*\n{cat_lines or '  (none)'}\n"
             f"\n🌐 *By language:*\n{lang_lines or '  (none)'}\n"
-            f"\n💾 DB: {self.db_path}/{self.table_name}"
+            f"\n💾 DB: pg0 (PostgreSQL + pgvector)"
         )
 
     # ═══════════════════════════════════════════════════════════════════
@@ -664,31 +813,30 @@ class MnemoziaKB:
         path = (args.get("path") or "").strip()
         category = (args.get("category") or "").strip()
 
-        where = "is_active = True"
+        cur = self.cur
         if category:
-            where += f" AND category LIKE '{category}%'"
-
-        try:
-            tbl = self.table.to_lance().scanner(filter=where, limit=5000).to_table()
-            col_names = tbl.column_names()
-            rows = []
-            for i in range(tbl.num_rows):
-                rows.append({col: tbl.column(col)[i].as_py() for col in col_names})
-        except Exception:
-            rows = self.table.search().where(where).limit(5000).to_list()
+            cur.execute(
+                "SELECT * FROM notes WHERE is_active = TRUE AND category LIKE %s LIMIT 5000",
+                (f"{category}%",)
+            )
+        else:
+            cur.execute(
+                "SELECT * FROM notes WHERE is_active = TRUE LIMIT 5000"
+            )
+        rows = cur.fetchall()
         if not rows:
             return "📭 No facts to export."
 
+        rows_dict = [_row_to_dict(r) for r in rows]
+
         if fmt == "markdown":
-            return self._export_markdown(rows, path)
+            return self._export_markdown(rows_dict, path)
         elif fmt == "json":
-            return self._export_json(rows, path)
+            return self._export_json(rows_dict, path)
         else:
             return f"❌ Unsupported format: '{fmt}'. Use 'markdown' or 'json'."
 
     def _export_markdown(self, rows: list, path: str) -> str:
-        import os
-        # ── group by category ──
         by_cat: Dict[str, list] = {}
         for r in rows:
             cat = r.get("category", "general")
@@ -699,8 +847,11 @@ class MnemoziaKB:
             lines.append(f"## {cat}\n")
             for r in by_cat[cat]:
                 tags = f" `{r.get('tags', '')}`" if r.get("tags") else ""
+                upd = r.get("updated_at", "")
+                if isinstance(upd, datetime):
+                    upd = upd.strftime("%Y-%m-%d %H:%M:%S")
                 lines.append(
-                    f"- `[{r['id']}]`{tags} (v{r['version']}, {r['updated_at']})\n"
+                    f"- `[{r['id']}]`{tags} (v{r['version']}, {upd})\n"
                     f"  {r['text']}\n"
                 )
 
@@ -713,11 +864,13 @@ class MnemoziaKB:
         return content
 
     def _export_json(self, rows: list, path: str) -> str:
-        import json, os
-        # ── strip vectors, keep everything else ──
         cleaned = []
         for r in rows:
-            item = {k: v for k, v in r.items() if k != "vector"}
+            item = {k: v for k, v in r.items() if k != "embedding"}
+            # Convert datetime to string
+            for k, v in item.items():
+                if isinstance(v, datetime):
+                    item[k] = v.strftime("%Y-%m-%d %H:%M:%S")
             cleaned.append(item)
 
         content = json.dumps(cleaned, ensure_ascii=False, indent=2)
@@ -751,120 +904,55 @@ class MnemoziaKB:
         return f"✂️ Unlinked [{id_a}] ↔ [{id_b}]."
 
     def _toggle_relation(self, id_a: str, id_b: str, *, add: bool):
-        for (src, tgt) in [(id_a, id_b), (id_b, id_a)]:
-            r = self._get_active_by_id(src)
+        cur = self.cur
+        for src, tgt in [(id_a, id_b), (id_b, id_a)]:
+            cur.execute(
+                "SELECT * FROM notes WHERE id = %s AND is_active = TRUE LIMIT 1",
+                (src,)
+            )
+            r = cur.fetchone()
             if not r:
                 continue
             related = set(r.get("related_to", "").split(",")) if r.get("related_to") else set()
-            related.discard("")  # clean empty strings from split
+            related.discard("")
             if add:
                 related.add(tgt)
             else:
                 related.discard(tgt)
-            self.table.update(
-                where=f"id = '{src}' AND version = {r['version']}",
-                values={"related_to": ",".join(sorted(related))}
+            cur.execute(
+                "UPDATE notes SET related_to = %s WHERE id = %s AND version = %s",
+                (",".join(sorted(related)), src, r["version"])
             )
+        self.conn.commit()
 
     # ═══════════════════════════════════════════════════════════════════
-    # ACTION: vacuum  (hard-delete archived rows older than N days)
+    # ACTION: vacuum
     # ═══════════════════════════════════════════════════════════════════
 
     def _action_vacuum(self, args: dict) -> str:
         days = int(args.get("older_than_days", 365))
-        cutoff = (datetime.now() - __import__("datetime").timedelta(days=days)).strftime("%Y-%m-%d")
-        try:
-            self.table.delete(
-                f"is_active = False AND updated_at < '{cutoff}'"
-            )
-        except Exception as e:
-            # LanceDB may not support DELETE with complex WHERE
-            return f"⚠️ Vacuum skipped: {e}\n   LanceDB doesn't support DELETE with date filters in all versions."
-        return f"🧹 Vacuumed: removed archived facts older than {cutoff}."
+        cutoff = datetime.now() - timedelta(days=days)
+        cur = self.cur
+        cur.execute(
+            "DELETE FROM notes WHERE is_active = FALSE AND updated_at < %s",
+            (cutoff,)
+        )
+        deleted = cur.rowcount
+        self.conn.commit()
+        return f"🧹 Vacuumed: removed {deleted} archived facts older than {days} days."
 
     # ═══════════════════════════════════════════════════════════════════
     # Internal helpers
     # ═══════════════════════════════════════════════════════════════════
 
-    def _embed(self, text: str, is_query: bool = True) -> list:
-        """Embed text using the lazy-loaded model. Adds query/passage prefix.
-
-        The e5 family requires asymmetric prefixes:
-        - queries:  "query: <text>"
-        - passages: "passage: <text>"
-        """
-        model = get_embedding_model()
-        prefix = QUERY_PREFIX if is_query else PASSAGE_PREFIX
-        result = model.compute_query_embeddings([f"{prefix}{text}"])
-        return result[0]  # returns list of vectors, take the first
-
-    def _embed_passage(self, text: str) -> list:
-        """Shortcut for embedding a document/passage."""
-        return self._embed(text, is_query=False)
-
     def _get_active_by_id(self, fact_id: str) -> Optional[dict]:
-        """Fetch the active version of a fact by ID (scalar filter, no FTS)."""
-        try:
-            tbl = self.table.to_lance().scanner(
-                filter=f"id = '{fact_id}' AND is_active = True",
-                limit=1,
-            ).to_table()
-            if tbl.num_rows == 0:
-                return None
-            return {col: tbl.column(col)[0].as_py() for col in tbl.column_names()}
-        except Exception:
-            return None
-
-    def _get_all_by_id(self, fact_id: str) -> list:
-        """Fetch all versions of a fact (active + archived)."""
-        try:
-            tbl = self.table.to_lance().scanner(
-                filter=f"id = '{fact_id}'",
-            ).to_table()
-            rows = []
-            col_names = tbl.column_names()
-            for i in range(tbl.num_rows):
-                rows.append({col: tbl.column(col)[i].as_py() for col in col_names})
-            return rows
-        except Exception:
-            return []
-
-    def _search_semantic(
-        self,
-        query: str,
-        limit: int = 5,
-        threshold: Optional[float] = None,
-        active_only: bool = True,
-    ) -> list:
-        """Pure vector search — embeds query manually, passes vector to LanceDB."""
-        vec = self._embed(query, is_query=True)
-        results = self.table.search(vec).limit(limit).to_list()
-        if active_only:
-            results = [r for r in results if r.get("is_active")]
-        if threshold is not None:
-            results = [r for r in results if r.get("_distance", 1.0) <= threshold]
-        return results
-
-    def _search_keyword(self, query: str, where: str, limit: int) -> list:
-        """FTS/text search — falls back to semantic because LanceDB lacks INVERTED index."""
-        # LanceDB 0.33 does not support INVERTED index; keyword search is unavailable.
-        # Fall back to semantic with the query text.
-        return self._search_semantic(query, limit=limit)
-
-    def _search_hybrid(self, query: str, where: str, limit: int) -> list:
-        """Semantic search with pre-filter (category, tags, etc.)."""
-        vec = self._embed(query, is_query=True)
-        try:
-            return (
-                self.table.search(vec)
-                .where(where, prefilter=True)
-                .limit(limit)
-                .to_list()
-            )
-        except Exception:
-            # Pre-filter failed; fall back to semantic
-            results = self._search_semantic(query, limit=limit * 2)
-            return results[:limit]
+        cur = self.cur
+        cur.execute(
+            "SELECT * FROM notes WHERE id = %s AND is_active = TRUE LIMIT 1",
+            (fact_id,)
+        )
+        row = cur.fetchone()
+        return _row_to_dict(row) if row else None
 
     # ═══════════════════════════════════════════════════════════════════
     # Usage
@@ -874,7 +962,7 @@ class MnemoziaKB:
         return (
             "📚 *Mnemozia — available actions:*\n\n"
             "  `add`         — store a fact (auto-dedup: exact → near-duplicate → contradiction flag)\n"
-            "  `search`      — semantic vector search (`mode: hybrid|semantic`; keyword falls back to semantic in LanceDB 0.33)\n"
+            "  `search`      — semantic vector search (`mode: hybrid|semantic|keyword`)\n"
             "  `update`      — new version of an existing fact (preserves history)\n"
             "  `merge`       — combine two facts into one (originals archived)\n"
             "  `split`       — break a fact into atomic parts\n"
@@ -891,18 +979,17 @@ class MnemoziaKB:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Helper functions used by merge/relate
+# Helper functions
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def _join_tags(tags_a: str, tags_b: str) -> str:
-    """Merge two comma-separated tag strings, deduplicating."""
     a_set = {t.strip() for t in tags_a.split(",") if t.strip()}
     b_set = {t.strip() for t in tags_b.split(",") if t.strip()}
     return ",".join(sorted(a_set | b_set))
 
 
 def _join_ids(*id_strings: str) -> str:
-    """Merge comma-separated ID strings, deduplicating."""
     ids: set[str] = set()
     for s in id_strings:
         ids.update(i.strip() for i in s.split(",") if i.strip())

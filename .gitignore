@@ -16,6 +16,9 @@ Thumbs.db
 .env
 *.env
 
+# Package management
+uv.lock
+
 # Temp / test artifacts
 /tmp/
 *.gguf

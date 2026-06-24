@@ -6,9 +6,11 @@
 
 Названа в честь Мнемозины (Μνημοσύνη) — греческой богини памяти. Хранит факты, находит их
 по смыслу (а не по точным ключевым словам) и отслеживает эволюцию знаний с полной историей версий.
-Построена на [LanceDB](https://lancedb.com/) +
-[intfloat/multilingual-e5-small](https://huggingface.co/intfloat/multilingual-e5-small) —
-работает на русском и английском, умещается в ~400 МБ ОЗУ.
+
+**Стек:**
+- **Хранилище:** [pg0](https://github.com/vectorize-io/pg0) (PostgreSQL 18 + pgvector)
+- **Эмбеддинги:** [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) через [llama.cpp](https://github.com/ggml-org/llama.cpp) — 1024-dim, 100+ языков, 4-bit квантование (378 МБ)
+- **Инференс:** `llama-server` как systemd-сервис, HTTP API — без SIGILL на старых CPU
 
 Создана при помощи [Hermes Agent](https://github.com/NousResearch/hermes-agent) на модели DeepSeek.
 

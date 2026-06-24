@@ -1,7 +1,7 @@
 """
 PostgreSQL + pgvector schema for Mnemozia.
 
-Vector dims: 384 (intfloat/multilingual-e5-small)
+Vector dims: 1024 (Qwen3-Embedding-0.6B via llama.cpp)
 """
 
 from __future__ import annotations
@@ -13,57 +13,37 @@ import psycopg2
 import psycopg2.extras
 
 # ---------------------------------------------------------------------------
-# Embedding model — lazy-loaded, so importing schema.py doesn't allocate GPU/RAM
+# Embedding via llama-server HTTP API
 # ---------------------------------------------------------------------------
 
-_embedding_model = None
-_EMBEDDING_DIMS = 384
-_MODEL_NAME = "intfloat/multilingual-e5-small"
-
-# Prefixes required by the e5 family for asymmetric search
-QUERY_PREFIX = "query: "
-PASSAGE_PREFIX = "passage: "
-
-
-def get_embedding_model():
-    """Lazy singleton — loads the model once, only when first needed.
-
-    Uses LanceDB's embedding registry (sentence-transformers).
-    Falls back to direct SentenceTransformer if LanceDB is unavailable.
-    """
-    global _embedding_model
-    if _embedding_model is not None:
-        return _embedding_model
-
-    # Try LanceDB embedding registry first
-    try:
-        from lancedb.embeddings import EmbeddingFunctionRegistry
-        registry = EmbeddingFunctionRegistry.get_instance()
-        _embedding_model = registry.get("sentence-transformers").create(
-            name=_MODEL_NAME
-        )
-        return _embedding_model
-    except Exception:
-        pass
-
-    # Fallback: direct SentenceTransformer
-    from sentence_transformers import SentenceTransformer
-    _embedding_model = SentenceTransformer(_MODEL_NAME)
-    return _embedding_model
+_EMBEDDING_DIMS = 1024
+_LLAMA_SERVER_URL = os.environ.get(
+    "MNEMOZIA_EMBED_URL",
+    "http://127.0.0.1:18080/embedding",
+)
 
 
 def compute_embeddings(texts: list[str]) -> list[list[float]]:
-    """Compute embeddings for a list of texts using the lazy-loaded model."""
-    model = get_embedding_model()
-    # Try LanceDB embedding registry API first
-    if hasattr(model, "compute_query_embeddings"):
-        return model.compute_query_embeddings(texts)
-    # Direct SentenceTransformer API
-    import numpy as np
-    results = model.encode(texts)
-    if isinstance(results, np.ndarray):
-        return results.tolist()
-    return [r.tolist() if hasattr(r, 'tolist') else list(r) for r in results]
+    """Compute embeddings for a list of texts via llama-server.
+
+    Each text is sent as a separate POST to the llama-server /embedding endpoint.
+    Uses prompt caching on the server side — repeated texts are near-instant.
+    """
+    import requests
+
+    results = []
+    for text in texts:
+        resp = requests.post(
+            _LLAMA_SERVER_URL,
+            json={"content": text},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        # Response: [{ "index": 0, "embedding": [[vec...]] }]
+        emb = data[0]["embedding"][0]
+        results.append(emb)
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -91,12 +71,12 @@ def ensure_schema(conn) -> None:
     # Enable pgvector
     cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
 
-    # Create the notes table with same schema as LanceDB version
-    cur.execute("""
+    # Create the notes table (1024-dim for Qwen3 embeddings)
+    cur.execute(f"""
         CREATE TABLE IF NOT EXISTS notes (
             id TEXT NOT NULL,
             text TEXT NOT NULL,
-            embedding vector(384),
+            embedding vector({_EMBEDDING_DIMS}),
             category TEXT DEFAULT 'general',
             tags TEXT DEFAULT '',
             language TEXT DEFAULT 'auto',
@@ -134,13 +114,10 @@ def ensure_schema(conn) -> None:
     """)
     count = cur.fetchone()[0]
     if count > 1000:
-        cur.execute("""
+        cur.execute(f"""
             CREATE INDEX IF NOT EXISTS idx_notes_embedding
             ON notes USING hnsw (embedding vector_cosine_ops)
         """)
-    else:
-        # IVFFlat requires data, so only create after inserts
-        pass
 
     cur.close()
 

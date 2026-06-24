@@ -6,9 +6,11 @@
 
 Named after Mnemosyne (Μνημοσύνη), the Greek goddess of memory. Stores facts, retrieves them
 by meaning (not exact keywords), and tracks how knowledge evolves with full version history.
-Built on [LanceDB](https://lancedb.com/) +
-[intfloat/multilingual-e5-small](https://huggingface.co/intfloat/multilingual-e5-small) —
-works in Russian and English, fits in ~400 MB RAM.
+
+**Stack:**
+- **Storage:** [pg0](https://github.com/vectorize-io/pg0) (PostgreSQL 18 + pgvector) — zero-config vector DB
+- **Embeddings:** [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) via [llama.cpp](https://github.com/ggml-org/llama.cpp) — 1024-dim, 100+ languages, 4-bit quantized (378 MB)
+- **Inference:** `llama-server` as a systemd service, communicates via HTTP API — no SIGILL on older CPUs
 
 Created with the help of [Hermes Agent](https://github.com/NousResearch/hermes-agent) on the DeepSeek model.
 

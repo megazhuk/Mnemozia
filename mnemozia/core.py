@@ -25,8 +25,6 @@ import psycopg2
 import psycopg2.extras
 
 from .schema import (
-    QUERY_PREFIX,
-    PASSAGE_PREFIX,
     compute_embeddings,
     connect,
     ensure_schema,
@@ -179,9 +177,8 @@ class MnemoziaKB:
     # ═══════════════════════════════════════════════════════════════════
 
     def _embed(self, text: str, is_query: bool = True) -> list[float]:
-        """Embed text using the lazy-loaded model with E5 prefixes."""
-        prefix = QUERY_PREFIX if is_query else PASSAGE_PREFIX
-        result = compute_embeddings([f"{prefix}{text}"])
+        """Embed text via llama-server. Qwen3 handles instructions natively."""
+        result = compute_embeddings([text])
         return result[0]
 
     def _embed_passage(self, text: str) -> list[float]:

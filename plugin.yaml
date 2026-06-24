@@ -2,9 +2,9 @@
 # Install: git clone https://github.com/megazhuk/Mnemozia.git ~/.hermes/plugins/mnemozia
 
 name: mnemozia
-version: 1.0.0
-description: Semantic knowledge base — Mnemozia (Μνημοσύνη). Store, search, and evolve facts using LanceDB embeddings with versioning.
-author: Hermes Community
+version: 2.0.0
+description: "Semantic knowledge base — Mnemozia (Μνημοσύνη). Stack: pg0 (PostgreSQL+pgvector) + llama.cpp + Qwen3-Embedding-0.6B. Store, search, and evolve facts with vector search and versioning."
+author: Alexey Zhukovsky
 license: MIT
 
 tools:

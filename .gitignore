@@ -22,6 +22,5 @@ Thumbs.db
 *.onnx
 onnx_models/
 
-# PoC scripts
-poc_*.py
-test_*.py
+# Old PoC scripts (skip specific file patterns instead)
+# test_*.py  — removed, now hosting proper test suite

@@ -1,23 +1,27 @@
-# Python
+# Dependencies
+.venv/
 __pycache__/
 *.pyc
-*.pyo
 *.egg-info/
-dist/
-build/
-
-# LanceDB
-*.lance/
-
-# IDE
-.vscode/
-.idea/
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Env
+# IDE
+.vscode/
+.idea/
+
+# Environment
 .env
-venv/
-.venv/
+*.env
+
+# Temp / test artifacts
+/tmp/
+*.gguf
+*.onnx
+onnx_models/
+
+# PoC scripts
+poc_*.py
+test_*.py

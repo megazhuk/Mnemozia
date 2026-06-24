@@ -18,12 +18,12 @@ Created with the help of [Hermes Agent](https://github.com/NousResearch/hermes-a
 
 - **14 operations:** add, search, update, merge, split, deactivate, reactivate, history, review, stats, export, relate, unrelate, vacuum
 - **3-stage dedup:** exact text → semantic near-duplicate → contradiction flag — no duplicates sneak in
-- **Semantic search:** vector search via multilingual-e5-small — find by meaning in Russian or English
+- **Semantic search:** vector search via Qwen3-Embedding-0.6B — find by meaning in 100+ languages
 - **Full versioning:** every update creates a new version; `history` shows the complete audit trail
 - **Merge & split:** combine overlapping facts or break complex ones into atomic pieces
 - **Confidence scoring:** 0.0 (hypothesis) → 1.0 (verified fact) — the agent knows when to trust
 - **LLM-optimised output:** search results include distance scores, confidence flags, merge tips
-- **Lazy loading:** the embedding model only loads on first use — zero RAM until you need it
+- **Embedding via systemd service:** `llama-server` runs as a standalone daemon — zero RAM in Hermes Python process
 - **Hermes-native:** install as a plugin (git clone to `~/.hermes/plugins/`) or standalone
 
 ## Install
@@ -44,7 +44,8 @@ pip install git+https://github.com/megazhuk/Mnemozia.git
 ```python
 from mnemozia import MnemoziaKB
 
-kb = MnemoziaKB("~/.hermes/knowledge_base")
+kb = MnemoziaKB()  # defaults to postgresql://postgres:postgres@127.0.0.1:5432/postgres
+# or: MnemoziaKB("postgresql://user:pass@host:5432/db")
 
 # Store facts
 kb.execute({"action": "add", "text": "OpenRouter требует socks5h-прокси 199.68.196.14:31149", "category": "devops/networking", "tags": "openrouter,proxy,socks5", "confidence": 1.0})
@@ -64,7 +65,7 @@ kb.execute({"action": "merge", "id": "a1b2c3", "with": "d4e5f6", "text": "объ
 | Action | Description |
 |--------|-------------|
 | `add` | Store a fact (auto-dedup: exact → near-duplicate → contradiction flag) |
-| `search` | Semantic vector search (LanceDB 0.33: semantic-only; keyword mode planned for future LanceDB) |
+| `search` | Semantic vector search (pgvector: semantic, keyword, and hybrid) |
 | `update` | New version of an existing fact (preserves history) |
 | `merge` | Combine two facts into one (originals archived) |
 | `split` | Break a complex fact into atomic parts |

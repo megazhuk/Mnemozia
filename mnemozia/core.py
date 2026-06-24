@@ -2,9 +2,9 @@
 Mnemozia — semantic knowledge base with versioning, dedup, and hybrid search.
 
 Named after Mnemosyne (Μνημοσύνη), the Greek goddess of memory.
-Built on PostgreSQL + pgvector + intfloat/multilingual-e5-small (384-dim, ~400 MB RAM).
-Designed for VPS with tight memory limits — model is lazy-loaded, searches use
-pgvector's HNSW/IVFFlat indexes for fast vector search.
+Built on pg0 (PostgreSQL 18 + pgvector) + llama.cpp + Qwen3-Embedding-0.6B (1024-dim).
+Embeddings are computed by llama-server via HTTP API, running as a systemd service.
+No Python ML dependencies — zero AVX2 requirements.
 
 Operations:
     add       search     update     merge      split
@@ -314,9 +314,14 @@ class MnemoziaKB:
             )
 
         # ── boost by importance then format ──
-        results.sort(
-            key=lambda r: (r.get("_distance", 1.0) - 0.5 * r.get("importance", 0.5))
-        )
+        # Normalize types: psycopg2 returns DOUBLE PRECISION as float,
+        # but computed constants (0.0 AS _distance) can come as Decimal.
+        def _sort_key(r):
+            dist = float(r.get("_distance", 1.0) or 1.0)
+            imp = float(r.get("importance", 0.5) or 0.5)
+            return dist - 0.5 * imp
+
+        results.sort(key=_sort_key)
 
         header = (
             f"🔍 *{query}*  ·  {mode}  ·  {len(results)} results"
